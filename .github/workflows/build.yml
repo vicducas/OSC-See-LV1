@@ -1,0 +1,48 @@
+# Compila OSCSee-LV1 para Mac (Apple Silicon) y Windows en las máquinas de GitHub.
+# Uso: pestaña "Actions" → "Compilar OSCSee-LV1" → "Run workflow".
+# Al terminar, los archivos quedan abajo en la página de la ejecución, sección "Artifacts".
+name: Compilar OSCSee-LV1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  mac:
+    runs-on: macos-14            # Mac con Apple Silicon (M1/M2/M3/M4)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilar la .app
+        run: bash build_mac.command
+      - name: Probar que la app arranca
+        run: |
+          "dist/OSCSee-LV1.app/Contents/MacOS/OSCSee-LV1" &
+          PID=$!
+          sleep 15
+          if kill -0 $PID 2>/dev/null; then echo "La app sigue abierta: OK"; kill $PID; else echo "La app se cerró sola"; cat ~/oscsee-lv1.log || true; exit 1; fi
+      - name: Empaquetar
+        run: ditto -c -k --keepParent "dist/OSCSee-LV1.app" OSCSee-LV1-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OSCSee-LV1-mac
+          path: OSCSee-LV1-mac.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilar el .exe
+        run: |
+          python -m pip install --upgrade pyinstaller
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "OSCSee-LV1" lv1_bridge.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OSCSee-LV1-windows
+          path: dist/OSCSee-LV1.exe
