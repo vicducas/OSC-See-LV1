@@ -10,7 +10,7 @@ on:
 
 jobs:
   mac:
-    runs-on: macos-14            # Mac con Apple Silicon (M1/M2/M3/M4)
+    runs-on: macos-14            # Mac con Apple Silicon (M1/M2/M3/M4/M5)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,12 +24,14 @@ jobs:
           PID=$!
           sleep 15
           if kill -0 $PID 2>/dev/null; then echo "La app sigue abierta: OK"; kill $PID; else echo "La app se cerró sola"; cat ~/oscsee-lv1.log || true; exit 1; fi
-      - name: Empaquetar
-        run: ditto -c -k --keepParent "dist/OSCSee-LV1.app" OSCSee-LV1-mac.zip
+      - name: Empaquetar en .dmg (no se rompe al pasar por Windows, Drive o USB)
+        run: |
+          mkdir -p dmg && cp -R "dist/OSCSee-LV1.app" dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname "OSCSee-LV1" -srcfolder dmg -ov -format UDZO OSCSee-LV1-mac.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: OSCSee-LV1-mac
-          path: OSCSee-LV1-mac.zip
+          path: OSCSee-LV1-mac.dmg
 
   windows:
     runs-on: windows-latest
