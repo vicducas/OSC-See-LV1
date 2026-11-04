@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OSCSee-LV1 - puente OSC See (OSC por UDP) -> Waves eMotion LV1 (OSC sobre TCP, protocolo MyFOH).
+LV1 Bridge - puente OSC (UDP) -> Waves eMotion LV1 (OSC sobre TCP, protocolo MyFOH).
 
 Doble clic y listo: busca el LV1 en la red, se conecta, y escucha OSC por UDP.
 Desde OSC See (o cualquier app OSC) mandas:
@@ -37,9 +37,9 @@ try:
 except ImportError:  # sin interfaz gráfica: el núcleo sigue siendo importable
     tk = ttk = None
 
-APP_NAME = "OSCSee-LV1"
+APP_NAME = "LV1 Bridge"
 VERSION = "1.0.0"
-DEVICE_NAME = "OSCSee-LV1"
+DEVICE_NAME = "OSC See Bridge"
 
 ZDNS_GROUP = "225.1.1.1"
 ZDNS_PORT = 13337
@@ -47,8 +47,7 @@ LV1_SERVICE = "_waveslv113._tcp"
 TX_HEADER = bytes([0, 0, 0, 2, 0, 0, 0, 0])
 HEADER_LEN = 8
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".oscsee-lv1.json")
-LOG_PATH = os.path.join(os.path.expanduser("~"), "oscsee-lv1.log")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".lv1bridge.json")
 DEFAULT_CONFIG = {"listen_port": 9000, "lv1_ip": "", "lv1_port": 0, "uuid": ""}
 
 
@@ -226,10 +225,9 @@ def discover_lv1(timeout=6.0, want_ip=None, log=lambda *a: None):
                     return want_ip, port
                 continue
             # la IP desde la que llegó el anuncio es la que de verdad rutea
-            # La IP de origen del anuncio es la que de verdad llega a esta máquina,
-            # aunque sea link-local (169.254.x.x, típica de la red SoundGrid).
-            log(f"Anuncio del LV1 desde {src[0]} (IPs que anuncia: {', '.join(v4) or '—'})")
-            return src[0], port
+            if _rank_ip(src[0]) >= 0 or not v4:
+                return src[0], port
+            return max(v4, key=_rank_ip), port
     finally:
         sock.close()
     return None
@@ -248,7 +246,6 @@ class LV1Client:
         self.current_scene = None
         self.stop_flag = False
         self.target = None
-        self.wake = threading.Event()
 
     # ── utilidades ──
     def log(self, msg):
@@ -310,16 +307,6 @@ class LV1Client:
         self.current_scene = idx
         self.events.put(("scene", idx, self.scenes.get(idx, "")))
 
-    def reconnect(self):
-        """Corta la conexión actual y vuelve a conectar con la config nueva, ya."""
-        self.wake.set()
-        with self.lock:
-            if self.sock:
-                try:
-                    self.sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
     # ── bucle principal ──
     def run(self):
         while not self.stop_flag:
@@ -337,24 +324,17 @@ class LV1Client:
                     self.sock = None
             if self.stop_flag:
                 break
-            if not self.wake.is_set():
-                self.status("off", "Reintentando…")
-            self.wake.wait(3)
-            self.wake.clear()
+            self.status("off", "Reintentando…")
+            time.sleep(3)
 
     def _session(self):
         ip = self.cfg.get("lv1_ip", "").strip()
-        port = int(self.cfg.get("lv1_port") or 0) if ip else 0
+        port = int(self.cfg.get("lv1_port") or 0)
         if not port:
             self.status("search", "Buscando LV1 en la red…")
             found = discover_lv1(timeout=6.0, want_ip=ip or None, log=self.log)
             if not found:
-                if ip:
-                    self.log(f"No llega el anuncio del LV1 {ip}. Revisa red / permiso de red local, "
-                             "o fija también el puerto en Ajustes.")
-                else:
-                    self.log("No apareció ningún LV1 (¿misma red? ¿permiso de red local? "
-                             "¿Waves Remote activo?)")
+                self.log("No apareció ningún LV1 (¿misma red? ¿Waves Remote activo?)")
                 return
             ip, port = found
             self.log(f"LV1 encontrado en {ip}:{port}")
@@ -494,21 +474,6 @@ class OSCListener:
     def _dispatch(self, addr, args):
         c = self.client
         a = addr.rstrip("/").lower()
-        if a == "/lv1":
-            # Sintaxis principal: /lv1 "<texto libre>"
-            #   "Canción A" -> escena por nombre · 3 -> escena 3 · "next"/"prev"
-            text = next((str(v) for t, v in args if t == "s"), None)
-            if text is None:
-                n = self._num(args)
-                return None if n is None else c.recall_index(n - 1)
-            cmd = c._norm(text)
-            if cmd in ("next", "siguiente", "sig"):
-                return c.step(+1)
-            if cmd in ("prev", "previous", "anterior", "ant"):
-                return c.step(-1)
-            if text.strip().isdigit() and not any(c._norm(n) == cmd for n in c.scenes.values()):
-                return c.recall_index(int(text.strip()) - 1)
-            return c.recall_name(text)
         if not addr.lower().startswith("/lv1/"):
             return
         if a == "/lv1/scene":
@@ -537,31 +502,7 @@ class OSCListener:
             target = addr[len("/lv1/raw"):]
             c.send(target, args)
             return self.events.put(("log", f"→ raw {target} {[v for _, v in args]}"))
-
-        # Sintaxis corta: el nombre de la escena va en la dirección.
-        #   /lv1/intro   /lv1/Cancion_A   /lv1/next   /lv1/prev   /lv1/3
-        # Mayúsculas, tildes, "_" y "-" no importan: /lv1/cancion_a == "Canción A".
-        if self._is_release(args):
-            return  # botones que mandan 1 al apretar y 0 al soltar: solo cuenta el 1
-        text = addr[len("/lv1/"):].strip("/").replace("/", " ")
-        cmd = c._norm(text)
-        if not cmd:
-            return
-        if cmd in ("next", "siguiente", "sig"):
-            return c.step(+1)
-        if cmd in ("prev", "previous", "anterior", "ant"):
-            return c.step(-1)
-        if cmd.isdigit() and not any(c._norm(n) == cmd for n in c.scenes.values()):
-            return c.recall_index(int(cmd) - 1)
-        return c.recall_name(text)
-
-    def _is_release(self, args):
-        if not args:
-            return False
-        t, v = args[0]
-        if t == "F":
-            return True
-        return t in ("i", "h", "f", "d") and v == 0
+        self.events.put(("log", f"Dirección no reconocida: {addr}"))
 
 
 # ─────────────────────────── Interfaz ───────────────────────────
@@ -612,18 +553,8 @@ class App:
         info.pack(fill="x")
         ips = ", ".join(local_ipv4s()) or "?"
         ttk.Label(info, text=f"Manda OSC a  {ips}  puerto  {self.cfg['listen_port']}").pack(anchor="w")
-        ttk.Label(info, text='/lv1/intro   ·   /lv1/next   ·   /lv1/prev   ·   /lv1/3   (mayúsculas y tildes no importan)',
+        ttk.Label(info, text="/lv1/scene <n>   ·   /lv1/scene/next   ·   /lv1/scene/prev",
                   foreground="#888").pack(anchor="w", pady=(2, 0))
-
-        conn = ttk.Frame(root, padding=(12, 10, 12, 0))
-        conn.pack(fill="x")
-        ttk.Label(conn, text="IP del LV1:").pack(side="left")
-        self.ip_var = tk.StringVar(value=self.cfg.get("lv1_ip", ""))
-        ip_entry = ttk.Entry(conn, textvariable=self.ip_var, width=18)
-        ip_entry.pack(side="left", padx=6)
-        ip_entry.bind("<Return>", lambda _e: self._apply_ip())
-        ttk.Button(conn, text="Conectar", command=self._apply_ip).pack(side="left")
-        ttk.Label(conn, text="vacío = automático", foreground="#888").pack(side="left", padx=8)
 
         cur = ttk.Frame(root, padding=12)
         cur.pack(fill="x")
@@ -658,14 +589,8 @@ class App:
         root.after(100, self._pump)
 
     def _log(self, msg):
-        line = time.strftime("%H:%M:%S ") + msg + "\n"
-        try:
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line)
-        except OSError:
-            pass
         self.log_txt.configure(state="normal")
-        self.log_txt.insert("end", line)
+        self.log_txt.insert("end", time.strftime("%H:%M:%S ") + msg + "\n")
         lines = int(self.log_txt.index("end-1c").split(".")[0])
         if lines > 500:
             self.log_txt.delete("1.0", f"{lines - 500}.0")
@@ -697,16 +622,6 @@ class App:
             pass
         self.root.after(50, self._pump)
 
-    def _apply_ip(self):
-        ip = self.ip_var.get().strip()
-        if ip and not _is_ipv4(ip):
-            self._log(f"'{ip}' no es una IP válida (ej: 192.168.1.10)")
-            return
-        self.cfg["lv1_ip"] = ip
-        save_config(self.cfg)
-        self._log(f"Conectando a {ip}…" if ip else "Modo automático: buscando LV1…")
-        self.client.reconnect()
-
     def _click_scene(self, _e):
         sel = self.scene_list.curselection()
         if sel:
@@ -723,7 +638,8 @@ class App:
         f.pack()
         fields = [
             ("Puerto OSC de entrada (UDP)", "listen_port"),
-            ("Puerto del LV1 (0 = automático, recomendado)", "lv1_port"),
+            ("IP del LV1 (vacío = automático)", "lv1_ip"),
+            ("Puerto del LV1 (0 = automático)", "lv1_port"),
         ]
         vars_ = {}
         for r, (label, key) in enumerate(fields):
@@ -734,35 +650,22 @@ class App:
 
         def save():
             try:
-                new_listen = int(vars_["listen_port"].get())
-                new_port = int(vars_["lv1_port"].get() or 0)
+                self.cfg["listen_port"] = int(vars_["listen_port"].get())
+                self.cfg["lv1_port"] = int(vars_["lv1_port"].get() or 0)
             except ValueError:
                 return
-            listen_changed = new_listen != int(self.cfg["listen_port"])
-            port_changed = new_port != int(self.cfg.get("lv1_port") or 0)
-            self.cfg["listen_port"], self.cfg["lv1_port"] = new_listen, new_port
+            self.cfg["lv1_ip"] = vars_["lv1_ip"].get().strip()
             save_config(self.cfg)
-            if port_changed:
-                if new_port and not self.cfg.get("lv1_ip"):
-                    self._log("Para fijar el puerto, pon también la IP del LV1.")
-                self.client.reconnect()
-            if listen_changed:
-                self._log("Puerto OSC guardado. Cierra y vuelve a abrir la app para aplicarlo.")
+            self._log("Ajustes guardados. Cierra y vuelve a abrir la app para aplicarlos.")
             w.destroy()
 
         ttk.Button(f, text="Guardar", command=save).grid(row=len(fields), column=1, sticky="e", pady=(10, 0))
 
 
 def main():
-    try:
-        root = tk.Tk()
-        App(root)
-        root.mainloop()
-    except Exception:
-        import traceback
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write("CRASH:\n" + traceback.format_exc())
-        raise
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
