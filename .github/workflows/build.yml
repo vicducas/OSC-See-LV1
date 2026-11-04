@@ -10,12 +10,32 @@ on:
 
 jobs:
   mac:
-    runs-on: macos-14            # Mac con Apple Silicon (M1/M2/M3/M4/M5)
+    runs-on: macos-14            # Mac con Apple Silicon (M1/M2/M3/M4)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Probar descubrimiento del LV1 por IPv6 (como anuncia un LV1 en Mac)
+        run: |
+          python - <<'EOF'
+          import socket, threading, time, lv1_bridge as b
+          msg = b.osc_encode("/zDNS", [("s","_waveslv113._tcp"),("s","test"),("i",0),("s","LV1-TEST"),
+                                       ("s","169.254.163.211"),("i",61234),("s","fe80::1")])
+          def send():
+              s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+              s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_LOOP, 1)
+              idx = socket.if_nametoindex("lo0")
+              s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, idx)
+              for _ in range(30):
+                  s.sendto(msg, ("ff02::fb", 13337, 0, idx)); time.sleep(0.2)
+          threading.Thread(target=send, daemon=True).start()
+          b.local_ipv4s = lambda: ["169.254.46.38"]
+          r = b.discover_lv1(timeout=5, log=print)
+          print("Resultado:", r)
+          assert r == ("169.254.163.211", 61234), r
+          print("IPv6 OK")
+          EOF
       - name: Compilar la .app
         run: bash build_mac.command
       - name: Probar que la app arranca
